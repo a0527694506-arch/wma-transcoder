@@ -10,6 +10,17 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 const app = express();
 app.use(cors());
 
+// פונקציית עזר להחלטה על מקור הקובץ
+function getSourceUrl(id, token) {
+  // אם מועבר Token בתוקף - משתמשים ב-Worker
+  if (token && token !== 'undefined' && token.trim() !== '') {
+    const workerBaseUrl = 'https://misty-block-12ce.a0527694506.workers.dev';
+    return `${workerBaseUrl}?id=${id}&token=${encodeURIComponent(token)}`;
+  }
+  // אם אין Token - מניחים שהקובץ ציבורי ופונים לנתיב הישיר של גוגל
+  return `https://lh3.googleusercontent.com/d/${id}`;
+}
+
 // 1. נתיב להזרמה והמרת WMA בלייב
 app.get('/stream-wma', async (req, res) => {
   const { id, token } = req.query;
@@ -18,8 +29,7 @@ app.get('/stream-wma', async (req, res) => {
     return res.status(400).send("Missing track ID");
   }
 
-  const workerBaseUrl = 'https://misty-block-12ce.a0527694506.workers.dev';
-  const sourceUrl = `${workerBaseUrl}?id=${id}&token=${encodeURIComponent(token || '')}`;
+  const sourceUrl = getSourceUrl(id, token);
 
   try {
     const response = await axios({
@@ -57,8 +67,7 @@ app.get('/wma-duration', (req, res) => {
     return res.status(400).json({ error: "Missing track ID" });
   }
 
-  const workerBaseUrl = 'https://misty-block-12ce.a0527694506.workers.dev';
-  const sourceUrl = `${workerBaseUrl}?id=${id}&token=${encodeURIComponent(token || '')}`;
+  const sourceUrl = getSourceUrl(id, token);
 
   // הרצת ffmpeg לקריאת אורך השיר
   execFile(ffmpegPath, ['-i', sourceUrl], (error, stdout, stderr) => {
