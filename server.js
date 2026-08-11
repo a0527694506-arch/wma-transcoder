@@ -10,13 +10,28 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 const app = express();
 app.use(cors());
 
-// פונקציית עזר להחלטה על מקור הקובץ
-function getSourceUrl(id, token) {
+// פונקציה לשליפת ה-URL הישיר והסופי לאחר הפניות (Redirects) של גוגל
+async function getDirectUrl(id, token) {
   if (token && token !== 'undefined' && token.trim() !== '') {
     const workerBaseUrl = 'https://misty-block-12ce.a0527694506.workers.dev';
     return `${workerBaseUrl}?id=${id}&token=${encodeURIComponent(token)}`;
   }
-  return `https://lh3.googleusercontent.com/d/${id}`;
+
+  const initialUrl = `https://lh3.googleusercontent.com/d/${id}`;
+  try {
+    const res = await axios.get(initialUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+      },
+      maxRedirects: 5,
+      responseType: 'stream'
+    });
+    const finalUrl = res.request.res.responseUrl || initialUrl;
+    res.data.destroy(); // סגירת הזרם מיד לאחר קבלת ה-URL
+    return finalUrl;
+  } catch (e) {
+    return initialUrl;
+  }
 }
 
 // 1. נתיב להזרמה והמרת WMA בלייב ל-MP3
@@ -27,9 +42,9 @@ app.get('/stream-wma', async (req, res) => {
     return res.status(400).send("Missing track ID");
   }
 
-  const sourceUrl = getSourceUrl(id, token);
-
   try {
+    const sourceUrl = await getDirectUrl(id, token);
+
     const response = await axios({
       method: 'get',
       url: sourceUrl,
@@ -46,13 +61,18 @@ app.get('/stream-wma', async (req, res) => {
       .audioBitrate(128)
       .format('mp3')
       .on('error', (err) => {
-        // התעלמות משגיאות ניתוק רגילות של הדפדפן בזמן עצירת שיר
-        if (!err.message.includes('Output stream closed') && !err.message.includes('pipe')) {
-          console.error('FFmpeg Streaming Error:', err.message);
+        const msg = err.message || '';
+        // התעלמות משגיאות סגירה רגילות והריגת תהליך יזוקה
+        if (
+          !msg.includes('Output stream closed') &&
+          !msg.includes('pipe') &&
+          !msg.includes('SIGKILL') &&
+          !msg.includes('killed')
+        ) {
+          console.error('FFmpeg Streaming Error:', msg);
         }
       });
 
-    // סגירה נקייה של ffmpeg במידה והמשתמש עצר/עבר שיר בדפדפן
     req.on('close', () => {
       command.kill('SIGKILL');
       if (response.data) response.data.destroy();
@@ -69,34 +89,38 @@ app.get('/stream-wma', async (req, res) => {
 });
 
 // 2. נתיב לשליפת אורך השיר בשניות עבור הנגן
-app.get('/wma-duration', (req, res) => {
+app.get('/wma-duration', async (req, res) => {
   const { id, token } = req.query;
 
   if (!id) {
     return res.status(400).json({ error: "Missing track ID" });
   }
 
-  const sourceUrl = getSourceUrl(id, token);
+  try {
+    const sourceUrl = await getDirectUrl(id, token);
 
-  // הרצת ffmpeg ישירות עם User-Agent עוקף חסימות (ללא Pipes שיוצרים EPIPE)
-  const args = [
-    '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    '-i', sourceUrl
-  ];
+    const args = [
+      '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      '-i', sourceUrl
+    ];
 
-  execFile(ffmpegPath, args, (error, stdout, stderr) => {
-    const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+|\d+)/);
-    if (match) {
-      const hours = parseInt(match[1], 10);
-      const minutes = parseInt(match[2], 10);
-      const seconds = parseFloat(match[3]);
-      const totalSeconds = Math.round(hours * 3600 + minutes * 60 + seconds);
-      return res.json({ duration: totalSeconds });
-    }
+    execFile(ffmpegPath, args, (error, stdout, stderr) => {
+      const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+|\d+)/);
+      if (match) {
+        const hours = parseInt(match[1], 10);
+        const minutes = parseInt(match[2], 10);
+        const seconds = parseFloat(match[3]);
+        const totalSeconds = Math.round(hours * 3600 + minutes * 60 + seconds);
+        return res.json({ duration: totalSeconds });
+      }
 
-    console.error("Could not parse duration. FFmpeg output tail:\n", stderr.slice(-300));
+      console.error("Could not parse duration. FFmpeg output tail:\n", stderr.slice(-400));
+      res.json({ duration: 0 });
+    });
+  } catch (err) {
+    console.error("Error resolving direct URL for duration:", err.message);
     res.json({ duration: 0 });
-  });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
