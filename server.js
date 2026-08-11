@@ -3,7 +3,7 @@ const cors = require('cors');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
-const { execFile } = require('child_process');
+const { spawn } = require('child_process');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -12,12 +12,10 @@ app.use(cors());
 
 // פונקציית עזר להחלטה על מקור הקובץ
 function getSourceUrl(id, token) {
-  // אם מועבר Token בתוקף - משתמשים ב-Worker
   if (token && token !== 'undefined' && token.trim() !== '') {
     const workerBaseUrl = 'https://misty-block-12ce.a0527694506.workers.dev';
     return `${workerBaseUrl}?id=${id}&token=${encodeURIComponent(token)}`;
   }
-  // אם אין Token - מניחים שהקובץ ציבורי ופונים לנתיב הישיר של גוגל
   return `https://lh3.googleusercontent.com/d/${id}`;
 }
 
@@ -35,7 +33,10 @@ app.get('/stream-wma', async (req, res) => {
     const response = await axios({
       method: 'get',
       url: sourceUrl,
-      responseType: 'stream'
+      responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+      }
     });
 
     res.setHeader('Content-Type', 'audio/mpeg');
@@ -60,7 +61,7 @@ app.get('/stream-wma', async (req, res) => {
 });
 
 // 2. נתיב לשליפת אורך השיר בשניות עבור הנגן
-app.get('/wma-duration', (req, res) => {
+app.get('/wma-duration', async (req, res) => {
   const { id, token } = req.query;
 
   if (!id) {
@@ -69,18 +70,55 @@ app.get('/wma-duration', (req, res) => {
 
   const sourceUrl = getSourceUrl(id, token);
 
-  // הרצת ffmpeg לקריאת אורך השיר
-  execFile(ffmpegPath, ['-i', sourceUrl], (error, stdout, stderr) => {
-    const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+|\d+)/);
-    if (match) {
-      const hours = parseInt(match[1], 10);
-      const minutes = parseInt(match[2], 10);
-      const seconds = parseFloat(match[3]);
-      const totalSeconds = Math.round(hours * 3600 + minutes * 60 + seconds);
-      return res.json({ duration: totalSeconds });
-    }
+  try {
+    const response = await axios({
+      method: 'get',
+      url: sourceUrl,
+      responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+      }
+    });
+
+    const ffmpegProc = spawn(ffmpegPath, ['-i', 'pipe:0']);
+    let stderrData = '';
+
+    response.data.pipe(ffmpegProc.stdin);
+
+    ffmpegProc.stderr.on('data', (chunk) => {
+      stderrData += chunk.toString();
+
+      // חילוץ האורך ברגע שהכותרת (Header) של ה-WMA נקראת
+      const match = stderrData.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+|\d+)/);
+      if (match && !res.headersSent) {
+        const hours = parseInt(match[1], 10);
+        const minutes = parseInt(match[2], 10);
+        const seconds = parseFloat(match[3]);
+        const totalSeconds = Math.round(hours * 3600 + minutes * 60 + seconds);
+
+        // עצירת ההורדה והתהליך מיד לאחר מציאת האורך (לחסכון בזמן ומשאבים)
+        response.data.destroy();
+        ffmpegProc.kill();
+        return res.json({ duration: totalSeconds });
+      }
+    });
+
+    ffmpegProc.on('close', () => {
+      if (!res.headersSent) {
+        console.error("FFmpeg finished without duration match. Output logs:\n", stderrData);
+        res.json({ duration: 0 });
+      }
+    });
+
+    ffmpegProc.on('error', (err) => {
+      console.error("FFmpeg process error:", err);
+      if (!res.headersSent) res.json({ duration: 0 });
+    });
+
+  } catch (error) {
+    console.error("Error in /wma-duration fetch:", error.message);
     res.json({ duration: 0 });
-  });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
